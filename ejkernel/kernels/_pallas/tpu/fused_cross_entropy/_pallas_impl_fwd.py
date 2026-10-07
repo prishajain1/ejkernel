@@ -14,16 +14,15 @@
 
 """TPU Pallas fused cross-entropy kernels.
 
-The replicated-vocab path streams logits from HBM into VMEM with TPU DMA
-semaphores, computes sparse cross-entropy row by row, and saves global ``lse``
-for the analytic backward in ``_pallas_impl_bwd``. Fully inactive row blocks
-are detected from ``targets`` and ``weights`` before the vocab scan, which is
-the sparse-row optimization used by the benchmark.
+The replicated-vocab path streams logits from HBM into VMEM with 2D BlockSpec
+double-buffering, computes sparse cross-entropy row by row in a single online
+softmax pass, and saves global ``lse`` for the analytic backward in
+``_pallas_impl_bwd``.
 
 The vocab-parallel path is designed for ``shard_map`` with a partition spec
-like ``P((dp, fsdp), sp, tp)``. Each TP shard runs a local Pallas stats kernel,
-JAX collectives merge row-wise softmax statistics across ``tp``, and the
-custom VJP backward writes only the local vocab shard's gradient.
+like ``P((dp, fsdp), sp, tp)``. Each TP shard runs a hardware-pipelined 2D
+Pallas online-softmax stats kernel over ``(M // block_m, V_local // block_v)``,
+and fused JAX collectives merge row-wise softmax statistics across ``tp``.
 """
 
 from __future__ import annotations
@@ -42,12 +41,7 @@ from ._pallas_impl_bwd import _ce_bwd_pallas
 
 
 def _default_block_v(vocab_size: int) -> int:
-    """Choose the default TPU vocab tile width for CE forward kernels.
-
-    Values are intentionally larger than the operation-layer cold-start
-    heuristic because this implementation floors stale small executor configs
-    before launching the Pallas kernel.
-    """
+    """Choose the default TPU vocab tile width for CE forward kernels."""
     if vocab_size <= 256:
         return 256
     if vocab_size <= 1024:
@@ -67,20 +61,7 @@ def _default_block_m() -> int:
 
 
 def _pallas_out_shape(shape: tuple[int, ...], dtype: jnp.dtype) -> jax.ShapeDtypeStruct:
-    """Build a Pallas ``out_shape`` entry that varies over the active manual mesh axes.
-
-    The returned ``ShapeDtypeStruct`` is annotated with the manual axes of the current abstract
-    mesh so the value is treated as varying (rather than replicated) under ``shard_map``, which the
-    vocab-parallel CE path relies on for correct per-shard outputs.
-
-    Args:
-        shape: Logical shape of the Pallas output array.
-        dtype: Element dtype of the Pallas output array.
-
-    Returns:
-        A ``jax.ShapeDtypeStruct`` carrying ``shape``/``dtype`` plus a ``ManualAxisType`` whose
-        ``varying`` set equals the current abstract mesh's manual axes.
-    """
+    """Build a Pallas ``out_shape`` entry that varies over the active manual mesh axes."""
     abstract_mesh = jax.sharding.get_abstract_mesh()
     axis_sizes = getattr(abstract_mesh, "axis_sizes", None) or getattr(abstract_mesh, "shape", {})
     axis_size = getattr(axis_sizes, "get", lambda _axis, default: default)
@@ -118,6 +99,116 @@ def _per_token_weights(targets: jax.Array, weights: jax.Array | None, ignore_ind
     if weights is None:
         return (targets != ignore_index).astype(jnp.float32)
     return weights.astype(jnp.float32)
+
+
+def _online_row_stats_2d_kernel(
+    x_ref,
+    lbl_ref,
+    m_out_ref,
+    d_out_ref,
+    s_out_ref,
+    m_scratch,
+    d_scratch,
+    s_scratch,
+    *,
+    bk: int,
+):
+    """Hardware-pipelined 2D BlockSpec online-softmax + target gather kernel.
+
+    Streams ``(bm, bk)`` tiles across ``grid = (M // bm, V // bk)`` with
+    ``dimension_semantics=("parallel", "arbitrary")`` so Mosaic double-buffers
+    HBM-to-VMEM DMA transfers while the VPU computes online ``max``, ``sum_exp``,
+    and target logit extraction in a single HBM pass.
+    """
+    j = pl.program_id(1)
+
+    @pl.when(j == 0)
+    def _init():
+        m_scratch[...] = jnp.full_like(m_scratch, -1e30)
+        d_scratch[...] = jnp.zeros_like(d_scratch)
+        s_scratch[...] = jnp.zeros_like(s_scratch)
+
+    x_tile = x_ref[...]
+
+    col_start = j * bk
+    target_offset = lbl_ref[...] - col_start
+    cols = jax.lax.broadcasted_iota(jnp.int32, (1, bk), 1)
+    is_target = cols == target_offset
+    matched_val = jnp.where(is_target, x_tile, jnp.zeros_like(x_tile))
+    tile_sel = jnp.sum(matched_val.astype(jnp.float32), axis=-1, keepdims=True)
+    s_scratch[...] = s_scratch[...] + tile_sel
+
+    tile_max = jnp.max(x_tile, axis=-1, keepdims=True).astype(jnp.float32)
+    old_m = m_scratch[...]
+    new_m = jnp.maximum(old_m, tile_max)
+    alpha = jnp.where(old_m <= -1e29, 0.0, jnp.exp(old_m - new_m))
+    tile_sum = jnp.sum(jnp.exp(x_tile.astype(jnp.float32) - new_m), axis=-1, keepdims=True)
+    d_scratch[...] = d_scratch[...] * alpha + tile_sum
+    m_scratch[...] = new_m
+
+    @pl.when(j == pl.num_programs(1) - 1)
+    def _store():
+        m_out_ref[...] = m_scratch[...]
+        d_out_ref[...] = d_scratch[...]
+        s_out_ref[...] = s_scratch[...]
+
+
+def _run_online_row_stats_2d(
+    logits_2d: jax.Array,
+    local_targets_1d: jax.Array,
+    *,
+    block_m: int,
+    block_v: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Run the 2D BlockSpec-pipelined online-softmax statistics kernel."""
+    m, k = logits_2d.shape
+    bm = min(int(block_m), m) if m >= 128 else int(block_m)
+    bk = min(int(block_v), k) if k >= 128 else int(block_v)
+
+    pad_m = (bm - (m % bm)) % bm
+    pad_k = (bk - (k % bk)) % bk
+    if pad_m > 0 or pad_k > 0:
+        x_pad = jnp.pad(logits_2d, ((0, pad_m), (0, pad_k)), constant_values=-1e30)
+    else:
+        x_pad = logits_2d
+
+    if pad_m > 0:
+        lbl_pad = jnp.pad(local_targets_1d[:, None], ((0, pad_m), (0, 0)), constant_values=-1)
+    else:
+        lbl_pad = local_targets_1d[:, None]
+
+    m_pad, k_pad = x_pad.shape
+    grid = (m_pad // bm, k_pad // bk)
+
+    m_out, d_out, s_out = pl.pallas_call(
+        functools.partial(_online_row_stats_2d_kernel, bk=bk),
+        out_shape=(
+            _pallas_out_shape((m_pad, 1), jnp.float32),
+            _pallas_out_shape((m_pad, 1), jnp.float32),
+            _pallas_out_shape((m_pad, 1), jnp.float32),
+        ),
+        grid=grid,
+        in_specs=[
+            pl.BlockSpec((bm, bk), lambda i, j: (i, j)),
+            pl.BlockSpec((bm, 1), lambda i, j: (i, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((bm, 1), lambda i, j: (i, 0)),
+            pl.BlockSpec((bm, 1), lambda i, j: (i, 0)),
+            pl.BlockSpec((bm, 1), lambda i, j: (i, 0)),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((bm, 1), jnp.float32),
+            pltpu.VMEM((bm, 1), jnp.float32),
+            pltpu.VMEM((bm, 1), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary"),
+            vmem_limit_bytes=96 * 1024 * 1024,
+        ),
+    )(x_pad, lbl_pad.astype(jnp.int32))
+
+    return m_out[:m, 0], d_out[:m, 0], s_out[:m, 0]
 
 
 def _copy_hbm_to_vmem(src_ref, dst_ref, sem_ref, row_start, col_start: int, block_m: int, size: int):
@@ -160,12 +251,7 @@ def _ce_fwd_kernel(
     block_v: int,
     block_m: int,
 ):
-    """Replicated-vocab CE forward kernel for one row block.
-
-    The kernel first copies targets and weights, checks whether any row in the
-    block is active, then streams vocab tiles twice: once for max/target/sum-logit
-    statistics and once for sum-exp. It writes per-row loss and LSE.
-    """
+    """Fallback replicated-vocab CE forward kernel when label_smoothing > 0."""
     row_start = pl.program_id(0) * block_m
     _, vocab_size = logits_ref.shape
     offsets = jnp.arange(block_v)
@@ -186,13 +272,6 @@ def _ce_fwd_kernel(
 
     @pl.when(jnp.any(valid))
     def _compute_active_block():
-        """Single streaming pass over vocab tiles (online softmax).
-
-        One DMA + reduction per tile: track a running max and a running sum-exp
-        (rescaled when the max grows), plus sum-of-logits and the target logit.
-        Logits are read from HBM exactly once (the former kernel streamed them
-        twice: once for max, once for sum-exp).
-        """
         max_val = jnp.full((block_m,), -jnp.inf, dtype=jnp.float32)
         sum_exp = jnp.zeros((block_m,), dtype=jnp.float32)
         sum_logits = jnp.zeros((block_m,), dtype=jnp.float32)
@@ -233,6 +312,24 @@ def _ce_fwd_kernel(
 def _ce_fwd_pallas(logits_2d, targets_1d, weights_1d, *, ignore_index, label_smoothing, z_loss, block_v, block_m):
     """Launch replicated-vocab TPU Pallas CE forward and trim padded rows."""
     n_rows, vocab_size = logits_2d.shape
+    if float(label_smoothing) == 0.0:
+        targets_i32 = targets_1d.astype(jnp.int32)
+        weights_f32 = weights_1d.astype(jnp.float32)
+        valid = (targets_i32 != int(ignore_index)) & (weights_f32 != 0.0)
+        safe_targets = jnp.where(valid, targets_i32, -1)
+        m_out, d_out, s_out = _run_online_row_stats_2d(
+            logits_2d,
+            safe_targets,
+            block_m=int(block_m),
+            block_v=int(block_v),
+        )
+        lse = m_out + jnp.log(d_out)
+        base = lse - s_out
+        if float(z_loss) != 0.0:
+            base = base + float(z_loss) * lse * lse
+        loss = jnp.where(valid, jnp.abs(weights_f32) * base, 0.0).astype(jnp.float32)
+        return loss, lse.astype(jnp.float32)
+
     n_rows_pad = pl.cdiv(n_rows, int(block_m)) * int(block_m)
     pad_rows = n_rows_pad - n_rows
     logits_pad = _pad_rows_2d(logits_2d, pad_rows)
@@ -300,13 +397,7 @@ def _ce_tp_stats_kernel(
     block_v: int,
     block_m: int,
 ):
-    """Compute local-vocab CE statistics for one row block on a TP shard.
-
-    ``targets_ref`` must already contain local-vocab target ids, i.e.
-    ``global_target - axis_index(tp) * local_vocab``. Only the shard that
-    owns the target contributes ``target_logit``; the caller merges the
-    outputs across ``tp`` with ``pmax`` / ``psum``.
-    """
+    """Fallback 1D local-vocab CE statistics kernel."""
     row_start = pl.program_id(0) * block_m
     _, local_vocab_size = logits_ref.shape
     offsets = jnp.arange(block_v)
@@ -327,8 +418,8 @@ def _ce_tp_stats_kernel(
 
     @pl.when(jnp.any(valid))
     def _compute_active_block():
-        """Collect local TP statistics for rows that are not masked out."""
         max_val = jnp.full((block_m,), -jnp.inf, dtype=jnp.float32)
+        sum_exp = jnp.zeros((block_m,), dtype=jnp.float32)
         sum_logits = jnp.zeros((block_m,), dtype=jnp.float32)
         target_logit = jnp.zeros((block_m,), dtype=jnp.float32)
         num_blocks = pl.cdiv(local_vocab_size, block_v)
@@ -341,22 +432,18 @@ def _ce_tp_stats_kernel(
             local_vocab_idx = start + offsets
             in_vocab = offsets < size
             masked = jnp.where(in_vocab[None, :], tile, -jnp.inf)
-            max_val = jnp.maximum(max_val, jnp.max(masked, axis=1))
+            tile_max = jnp.max(masked, axis=1)
+            new_max = jnp.maximum(max_val, tile_max)
+            correction = jnp.exp(max_val - new_max)
+            tile_sum_exp = jnp.sum(
+                jnp.where(in_vocab[None, :], jnp.exp(tile - new_max[:, None]), 0.0),
+                axis=1,
+            )
+            sum_exp = sum_exp * correction + tile_sum_exp
+            max_val = new_max
             sum_logits = sum_logits + jnp.sum(jnp.where(in_vocab[None, :], tile, 0.0), axis=1)
             target_logit = target_logit + jnp.sum(
                 jnp.where(in_vocab[None, :] & (local_vocab_idx[None, :] == target[:, None]), tile, 0.0),
-                axis=1,
-            )
-
-        sum_exp = jnp.zeros((block_m,), dtype=jnp.float32)
-        for block_idx in range(num_blocks):
-            start = block_idx * block_v
-            size = min(block_v, local_vocab_size - start)
-            _copy_hbm_to_vmem(logits_ref, logits_tile_ref, dma_sem_ref, row_start, start, block_m, size)
-            tile = logits_tile_ref[...].astype(jnp.float32)
-            in_vocab = offsets < size
-            sum_exp = sum_exp + jnp.sum(
-                jnp.where(in_vocab[None, :], jnp.exp(tile - max_val[:, None]), 0.0),
                 axis=1,
             )
 
@@ -367,55 +454,28 @@ def _ce_tp_stats_kernel(
 
 
 def _ce_tp_stats_pallas(logits_2d, targets_1d, weights_1d, *, ignore_index, block_v, block_m):
-    """Launch the local-vocab CE stats kernel used by the TP path.
+    """Launch the 2D BlockSpec-pipelined local-vocab CE stats kernel used by the TP path.
 
     Returns per-row ``(local_max, local_sum_exp, local_target_logit,
-    local_sum_logits)``. These are not final loss values until merged across
-    the vocab-parallel axis.
+    local_sum_logits)``.
     """
     n_rows = logits_2d.shape[0]
-    n_rows_pad = pl.cdiv(n_rows, int(block_m)) * int(block_m)
-    pad_rows = n_rows_pad - n_rows
-    logits_pad = _pad_rows_2d(logits_2d, pad_rows)
-    targets_pad = _pad_rows_1d(targets_1d, pad_rows, ignore_index)
-    weights_pad = _pad_rows_1d(weights_1d, pad_rows)
-    max_val, sum_exp, target_logit, sum_logits = pl.pallas_call(
-        functools.partial(
-            _ce_tp_stats_kernel,
-            ignore_index=int(ignore_index),
-            block_v=int(block_v),
-            block_m=int(block_m),
-        ),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-            ],
-            out_specs=[
-                pl.BlockSpec((int(block_m),), lambda row_block: (row_block,)),
-                pl.BlockSpec((int(block_m),), lambda row_block: (row_block,)),
-                pl.BlockSpec((int(block_m),), lambda row_block: (row_block,)),
-                pl.BlockSpec((int(block_m),), lambda row_block: (row_block,)),
-            ],
-            scratch_shapes=[
-                pltpu.VMEM((int(block_m), int(block_v)), logits_2d.dtype),
-                pltpu.VMEM((int(block_m),), targets_1d.dtype),
-                pltpu.VMEM((int(block_m),), weights_1d.dtype),
-                pltpu.SemaphoreType.DMA((1,)),
-            ],
-            grid=(n_rows_pad // int(block_m),),
-        ),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        out_shape=[
-            _pallas_out_shape((n_rows_pad,), jnp.float32),
-            _pallas_out_shape((n_rows_pad,), jnp.float32),
-            _pallas_out_shape((n_rows_pad,), jnp.float32),
-            _pallas_out_shape((n_rows_pad,), jnp.float32),
-        ],
-    )(logits_pad, targets_pad.astype(jnp.int32), weights_pad.astype(jnp.float32))
-    return max_val[:n_rows], sum_exp[:n_rows], target_logit[:n_rows], sum_logits[:n_rows]
+    targets_i32 = targets_1d.astype(jnp.int32)
+    weights_f32 = weights_1d.astype(jnp.float32)
+    valid = (targets_i32 != int(ignore_index)) & (weights_f32 != 0.0)
+    safe_targets = jnp.where(valid, targets_i32, -1)
+
+    max_val, sum_exp, target_logit = _run_online_row_stats_2d(
+        logits_2d,
+        safe_targets,
+        block_m=int(block_m),
+        block_v=int(block_v),
+    )
+    max_val = jnp.where(valid, max_val, -jnp.inf).astype(jnp.float32)
+    sum_exp = jnp.where(valid, sum_exp, 0.0).astype(jnp.float32)
+    target_logit = jnp.where(valid, target_logit, 0.0).astype(jnp.float32)
+    sum_logits = jnp.zeros((n_rows,), dtype=jnp.float32)
+    return max_val, sum_exp, target_logit, sum_logits
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
@@ -482,43 +542,50 @@ def _ce_tp_loss_and_lse(
     block_m,
     vocab_parallel_axis,
 ):
-    """Build TP-vocab sparse CE loss from local Pallas stats plus collectives.
-
-    The local Pallas kernel streams only this device's vocab shard. This helper
-    shifts global targets into local coordinates, merges max/sum-exp and target
-    logit over ``vocab_parallel_axis``, and returns the per-row loss plus the
-    global ``lse`` needed by the analytic backward.
-    """
-    local_vocab_size = int(logits_2d.shape[-1])
+    """Build TP-vocab sparse CE loss from 2D-pipelined Pallas stats plus fused collectives."""
+    n_rows, local_vocab_size = int(logits_2d.shape[0]), int(logits_2d.shape[-1])
     axis_idx = jax.lax.axis_index(vocab_parallel_axis)
     vocab_start = axis_idx * local_vocab_size
+    targets_i32 = targets_1d.astype(jnp.int32)
+    weights_f32 = weights_1d.astype(jnp.float32)
+    valid = (targets_i32 != int(ignore_index)) & (weights_f32 != 0.0)
     local_targets = jnp.where(
-        targets_1d == int(ignore_index),
+        valid,
+        targets_i32 - vocab_start,
         jnp.array(int(ignore_index), dtype=jnp.int32),
-        targets_1d.astype(jnp.int32) - vocab_start,
     )
-    local_max, local_sum_exp, local_target_logit, local_sum_logits = _ce_tp_stats_pallas(
+
+    local_max, local_sum_exp, local_target_logit = _run_online_row_stats_2d(
         logits_2d,
-        local_targets,
-        weights_1d,
-        ignore_index=ignore_index,
-        block_v=block_v,
-        block_m=block_m,
+        jnp.where(valid, local_targets, -1),
+        block_m=int(block_m),
+        block_v=int(block_v),
     )
-    valid = (targets_1d != int(ignore_index)) & (weights_1d != 0.0)
-    global_max = jax.lax.pmax(local_max, vocab_parallel_axis)
-    finite = jnp.isfinite(local_max) & jnp.isfinite(global_max)
-    scaled_sum = jnp.where(finite, local_sum_exp * jnp.exp(local_max - global_max), 0.0)
-    global_sum_exp = jax.lax.psum(scaled_sum, vocab_parallel_axis)
-    lse = jnp.where(valid, jnp.log(global_sum_exp) + global_max, 0.0)
-    target_logit = jax.lax.psum(local_target_logit, vocab_parallel_axis)
-    sum_logits = jax.lax.psum(local_sum_logits, vocab_parallel_axis)
-    confidence = 1.0 - float(label_smoothing)
-    low_conf = jnp.array(0.0, dtype=jnp.float32)
-    normalizing_constant = 0.0
-    eff_target_w = confidence - low_conf
-    base = lse - eff_target_w * target_logit - low_conf * sum_logits - normalizing_constant
-    per_row = jnp.where(valid, jnp.abs(weights_1d) * (base + float(z_loss) * lse * lse), 0.0)
+
+    if n_rows >= 8192:
+        # Single-barrier AllGather of packed (3, M) local statistics for large row counts.
+        stats = jnp.stack([local_max, local_sum_exp, local_target_logit], axis=0)
+        gathered = jax.lax.all_gather(stats, vocab_parallel_axis)
+        all_m = gathered[:, 0, :]
+        all_d = gathered[:, 1, :]
+        all_s = gathered[:, 2, :]
+        global_max = jnp.max(all_m, axis=0)
+        global_sum_exp = jnp.sum(all_d * jnp.exp(all_m - global_max), axis=0)
+        target_logit = jnp.sum(all_s, axis=0)
+    else:
+        # Two-barrier reduction with packed (2, M) psum for scaled_sum and target_logit.
+        global_max = jax.lax.pmax(local_max, vocab_parallel_axis)
+        scaled_sum = local_sum_exp * jnp.exp(local_max - global_max)
+        packed = jnp.stack([scaled_sum, local_target_logit], axis=0)
+        summed = jax.lax.psum(packed, vocab_parallel_axis)
+        global_sum_exp = summed[0]
+        target_logit = summed[1]
+
+    lse = jnp.where(valid, global_max + jnp.log(global_sum_exp), 0.0)
+    base = lse - target_logit
+    if float(z_loss) != 0.0:
+        base = base + float(z_loss) * lse * lse
+    per_row = jnp.where(valid, jnp.abs(weights_f32) * base, 0.0)
     return per_row.astype(jnp.float32), lse.astype(jnp.float32), local_targets.astype(jnp.int32)
 
 
@@ -576,11 +643,7 @@ def _ce_loss_tp_fwd(
 
 
 def _ce_loss_tp_bwd(ignore_index, label_smoothing, z_loss, block_v, block_m, vocab_parallel_axis, residual, dy):
-    """Backward rule for TP-vocab CE.
-
-    VMA-aware ``shard_map`` keeps the scalar cotangent replicated across TP
-    shards, so the local Pallas gradient can be returned directly.
-    """
+    """Backward rule for TP-vocab CE."""
     logits_2d, lse, local_targets, weights_1d = residual
     dlogits = _ce_bwd_pallas(
         logits_2d,
@@ -621,14 +684,7 @@ def fused_cross_entropy_pallas(
     block_v: int = 0,
     block_m: int = 0,
 ):
-    """Run TPU Pallas fused sparse cross-entropy.
-
-    Sparse integer targets are handled by Pallas. Dense ``soft_targets`` fall
-    back to XLA because that path needs full distribution arithmetic rather than
-    target ownership. When ``vocab_parallel_axis`` is provided, the logits are
-    interpreted as the local vocab shard inside ``shard_map`` and TP collectives
-    produce the global softmax loss.
-    """
+    """Run TPU Pallas fused sparse cross-entropy."""
     if reduction not in ("none", "sum", "mean"):
         raise ValueError(f"Invalid reduction '{reduction}'; expected one of none/sum/mean.")
     if not 0.0 <= label_smoothing < 1.0:
@@ -663,7 +719,7 @@ def fused_cross_entropy_pallas(
     flat_weights = _per_token_weights(flat_targets, None if weights is None else weights.reshape(-1), ignore_index)
     default_bv = _default_block_v(int(flat_logits.shape[-1]))
     bv = max(default_bv, int(block_v)) if int(block_v) > 0 else default_bv
-    bm = _default_block_m()
+    bm = int(block_m) if int(block_m) > 0 else _default_block_m()
 
     if vocab_parallel_axis is None:
         per_row = _fused_ce_loss_pallas(
